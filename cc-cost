@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""cc-cost: what your Claude Code usage would have cost at public API prices.
+
+Reads the transcripts in ~/.claude/projects (including subagent transcripts),
+de-duplicates API responses by message id, and prices every token type
+separately: input, 5m/1h cache writes, cache reads, output, web searches.
+
+  cc-cost                 interactive view (in a terminal)
+  cc-cost --print         static report (also used when piped)
+  cc-cost --session       just the current session (latest transcript for $PWD)
+
+Static report options:
+  --full                  add token columns (input, cache writes/reads, output)
+  --days N                length of the daily chart (default 14)
+  --no-color
+"""
+import argparse, json, os, re, sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# $ per million tokens: input, output, cache write 5m, cache write 1h, cache read
+# Source: Anthropic API pricing (first-party rates), as of 2026-11.
+PRICES = {
+    "claude-fable-5-2":   (8.00, 40.00, 10.00, 16.00, 0.20),
+    "claude-mythos-5-2":  (8.00, 40.00, 10.00, 16.00, 0.20),
+    "claude-fable-5-1":   (10.00, 50.00, 12.50, 20.00, 0.25),
+    "claude-mythos-5-1":  (10.00, 50.00, 12.50, 20.00, 0.25),
+    "claude-fable-5":     (10.00, 50.00, 12.50, 20.00, 1.00),
+    "claude-mythos-5":    (10.00, 50.00, 12.50, 20.00, 1.00),
+    "claude-opus-5-5":    (4.00, 20.00, 5.00, 8.00, 0.20),
+    "claude-opus-5":      (5.00, 25.00, 6.25, 10.00, 0.50),
+    "claude-opus-4-8":    (5.00, 25.00, 6.25, 10.00, 0.50),
+    "claude-opus-4-7":    (5.00, 25.00, 6.25, 10.00, 0.50),
+    "claude-opus-4-6":    (5.00, 25.00, 6.25, 10.00, 0.50),
+    "claude-sonnet-5-5":  (2.00, 10.00, 2.50, 4.00, 0.10),
+    "claude-sonnet-5":    (2.00, 10.00, 2.50, 4.00, 0.20),
+    "claude-sonnet-4-6":  (3.00, 15.00, 3.75, 6.00, 0.30),
+    "claude-haiku-5-5":   (0.10, 0.50, 0.125, 0.20, 0.01),
+    "claude-haiku-4-5":   (1.00, 5.00, 1.25, 2.00, 0.10),
+}
+# Haiku 5.5 prompts over 100K tokens use a 5x rate card.
+LONG_PROMPT = {"claude-haiku-5-5": (100_000, 5.0)}
+FAST_MULT = 2.0            # fast mode is 2x standard on every model that offers it
+WEB_SEARCH_PER_REQ = 0.01  # $10 / 1000 searches
+
+# Cost parts, in display order.
+PARTS = ("cache writes", "cache reads", "output", "input", "web search")
+
+PERIODS = (("Today", 1), ("7 days", 7), ("30 days", 30), ("All time", None))
+
+
+def base_model(m):
+    m = re.sub(r"\[.*?\]$", "", m or "")
+    m = re.sub(r"^(us\.|eu\.|global\.)?anthropic\.", "", m)
+    m = re.sub(r"(-\d{8}|@\d{8}|-v\d+(:\d+)?)$", "", m)
+    return m
+
+
+def price(model, u):
+    """Dollar cost of one response as a tuple in PARTS order, or None if unpriced."""
+    p = PRICES.get(model)
+    if not p:
+        return None
+    inp = u.get("input_tokens", 0) or 0
+    out = u.get("output_tokens", 0) or 0
+    cr = u.get("cache_read_input_tokens", 0) or 0
+    cc = u.get("cache_creation") or {}
+    w5 = cc.get("ephemeral_5m_input_tokens")
+    w1 = cc.get("ephemeral_1h_input_tokens")
+    if w5 is None and w1 is None:  # older transcripts: assume 5m
+        w5, w1 = u.get("cache_creation_input_tokens", 0) or 0, 0
+    w5, w1 = w5 or 0, w1 or 0
+    mult = 1.0
+    if model in LONG_PROMPT and inp + cr + w5 + w1 > LONG_PROMPT[model][0]:
+        mult = LONG_PROMPT[model][1]
+    if u.get("speed") == "fast":
+        mult *= FAST_MULT
+    k = mult / 1e6
+    searches = (u.get("server_tool_use") or {}).get("web_search_requests") or 0
+    return ((w5 * p[2] + w1 * p[3]) * k, cr * p[4] * k, out * p[1] * k, inp * p[0] * k,
+            searches * WEB_SEARCH_PER_REQ)
+
+
+def project_label(dirname):
+    home = str(Path.home()).replace("/", "-")
+    return "~" + dirname[len(home):].replace("-", "/") if dirname.startswith(home) else dirname
+
+
+def load(root, only_files=None):
+    """Return (rows, titles). One row per distinct API response."""
+    msgs, titles = {}, {}
+    files = sorted(only_files or root.rglob("*.jsonl"))
+    for f in files:
+        proj = f.relative_to(root).parts[0]
+        try:
+            fh = open(f, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    if '-title"' in line or '"last-prompt"' in line:
+                        try:
+                            d = json.loads(line)
+                        except ValueError:
+                            continue
+                        rank, text = {"custom-title": (3, d.get("customTitle")),
+                                      "ai-title": (2, d.get("aiTitle")),
+                                      "last-prompt": (1, d.get("lastPrompt"))}.get(d.get("type"), (0, None))
+                        sid = d.get("sessionId")
+                        if text and sid and rank >= titles.get(sid, (0,))[0]:
+                            titles[sid] = (rank, " ".join(str(text).split()))
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                m = d.get("message")
+                if not isinstance(m, dict) or "usage" not in m:
+                    continue
+                model = base_model(m.get("model"))
+                if model == "<synthetic>" or not model:
+                    continue
+                mid = m.get("id") or d.get("requestId") or d.get("uuid")
+                u = m["usage"]
+                prev = msgs.get(mid)
+                if prev and (prev["u"].get("output_tokens") or 0) >= (u.get("output_tokens") or 0):
+                    continue
+                try:
+                    t = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).astimezone()
+                except Exception:
+                    continue
+                parts = price(model, u)
+                msgs[mid] = {"model": model, "u": u, "t": t, "day": t.date(), "proj": proj,
+                             "sid": d.get("sessionId") or f.stem,
+                             "parts": parts, "cost": sum(parts) if parts else 0.0}
+    return list(msgs.values()), {k: v[1] for k, v in titles.items()}
+
+
+# ---------- aggregation ----------
+def in_period(rows, days, today):
+    if days is None:
+        return rows
+    start = today - timedelta(days=days - 1)
+    return [r for r in rows if r["day"] >= start]
+
+
+def aggregate(rows):
+    agg = defaultdict(lambda: {"cost": 0.0, "in": 0, "out": 0, "cw": 0, "cr": 0, "n": 0, "unpriced": 0})
+    for r in rows:
+        a, u = agg[r["model"]], r["u"]
+        a["n"] += 1
+        a["in"] += u.get("input_tokens", 0) or 0
+        a["out"] += u.get("output_tokens", 0) or 0
+        a["cw"] += u.get("cache_creation_input_tokens", 0) or 0
+        a["cr"] += u.get("cache_read_input_tokens", 0) or 0
+        a["cost"] += r["cost"]
+        if r["parts"] is None:
+            a["unpriced"] += 1
+    return sorted(agg.items(), key=lambda kv: kv[1]["cost"], reverse=True)
+
+
+def by_part(rows):
+    tot = [0.0] * len(PARTS)
+    for r in rows:
+        if r["parts"]:
+            for i, v in enumerate(r["parts"]):
+                tot[i] += v
+    return [(n, v) for n, v in zip(PARTS, tot) if v > 0 or n != "web search"]
+
+
+def by_key(rows, key):
+    per = defaultdict(float)
+    for r in rows:
+        per[r[key]] += r["cost"]
+    return sorted(per.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def by_day(rows):
+    per = defaultdict(lambda: defaultdict(float))
+    for r in rows:
+        per[r["day"]][r["model"]] += r["cost"]
+    return per
+
+
+def by_session(rows, day):
+    per = {}
+    for r in rows:
+        if r["day"] == day:
+            s = per.setdefault(r["sid"], {"cost": 0.0, "proj": r["proj"]})
+            s["cost"] += r["cost"]
+    return sorted(per.items(), key=lambda kv: kv[1]["cost"], reverse=True)
+
+
+def model_order(rows):
+    return [m for m, _ in by_key(rows, "model")]
+
+
+def stacked(day_costs, order, top, width):
+    """[(model, cells)] for one day; cumulative rounding keeps the total to scale."""
+    segs, used, acc = [], 0, 0.0
+    for m in order:
+        acc += day_costs.get(m, 0)
+        seg = round(acc / top * width) - used
+        if seg > 0:
+            segs.append((m, seg))
+            used += seg
+    return segs
+
+
+# ---------- formatting ----------
+def fmt_tok(n):
+    for div, s in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if n >= div:
+            return f"{n/div:.1f}{s}"
+    return str(int(n))
+
+
+def money(x):
+    return f"${x:,.2f}" if x < 1000 else f"${x:,.0f}"
+
+
+def bar(frac, width):
+    full = max(0.0, min(1.0, frac)) * width
+    n = int(full)
+    rem = " ▏▎▍▌▋▊▉"[int((full - n) * 8)] if n < width else ""
+    return "█" * n + rem.strip()
+
+
+def short(m):
+    return m.replace("claude-", "")
+
+
+def clip_left(s, w):
+    return s if len(s) <= w else "…" + s[-(w - 1):]
+
+
+def clip(s, w):
+    return s if len(s) <= w else s[:max(0, w - 1)] + "…"
+
+
+# ---------- static report ----------
+C = {"b": "\033[1m", "d": "\033[2m", "r": "\033[0m", "g": "\033[32m", "y": "\033[33m", "c": "\033[36m"}
+PALETTE_256 = [208, 75, 114, 177, 221, 203]
+
+
+def section(title, rows, colors, full=False, width=14):
+    print(f"\n{C['b']}{title}{C['r']}")
+    if not rows:
+        print(f"  {C['d']}no usage{C['r']}")
+        return
+    agg = aggregate(rows)
+    total = sum(a["cost"] for _, a in agg)
+    top = max((a["cost"] for _, a in agg), default=0) or 1
+    pad = 34 if full else 0
+    hdr = f"{'input':>8}{'cache w':>9}{'cache r':>9}{'output':>8}" if full else ""
+    print(f"  {C['d']}{'model':<20}{'reqs':>7}{hdr}   {'cost':>10}{C['r']}")
+    for m, a in agg:
+        flag = f" {C['y']}(unpriced){C['r']}" if a["unpriced"] else ""
+        toks = (f"{fmt_tok(a['in']):>8}{fmt_tok(a['cw']):>9}{fmt_tok(a['cr']):>9}{fmt_tok(a['out']):>8}"
+                if full else "")
+        print(f"  {colors.get(m,'')}{short(m):<20}{C['r']}{a['n']:>7}{toks}   {C['g']}{money(a['cost']):>10}{C['r']} "
+              f"{colors.get(m,'')}{bar(a['cost']/top, width)}{C['r']}{flag}")
+    print(f"  {'':<27}{'':>{pad}}   {C['b']}{C['g']}{money(total):>10}{C['r']}{C['b']} total{C['r']}")
+    print(f"  {C['d']}" + " · ".join(f"{n} {money(v)}" for n, v in by_part(rows)) + C["r"])
+
+
+def daily_chart(rows, days, colors, today, width=20):
+    start = today - timedelta(days=days - 1)
+    per = by_day(rows)
+    top = max((sum(per[start + timedelta(days=i)].values()) for i in range(days)), default=0) or 1
+    print(f"\n{C['b']}Daily cost, last {days} days{C['r']}  ", end="")
+    print("  ".join(f"{c}■{C['r']} {short(m)}" for m, c in colors.items()))
+    for i in range(days):
+        d = start + timedelta(days=i)
+        tot = sum(per[d].values())
+        segs = stacked(per[d], list(colors), top, width)
+        line = "".join(colors[m] + "█" * n + C["r"] for m, n in segs)
+        used = sum(n for _, n in segs)
+        print(f"  {C['d']}{d:%a %m-%d}{C['r']} {line}{' ' * (width - used)} "
+              f"{C['g'] if tot else C['d']}{money(tot)}{C['r']}")
+
+
+def projects_section(rows, title, top_n=10, width=14):
+    per = by_key(rows, "proj")[:top_n]
+    if not per:
+        return
+    top = per[0][1] or 1
+    print(f"\n{C['b']}{title}{C['r']}")
+    for p, v in per:
+        print(f"  {clip_left(project_label(p), 34):<34} {C['g']}{money(v):>10}{C['r']} {C['c']}{bar(v/top, width)}{C['r']}")
+
+
+def report(rows, a, today):
+    colors = {m: f"\033[38;5;{PALETTE_256[i % len(PALETTE_256)]}m" if C["r"] else ""
+              for i, m in enumerate(model_order(rows))}
+    first = min((r["day"] for r in rows), default=today)
+    for name, days in PERIODS:
+        label = {"7 days": "Last 7 days", "30 days": "Last 30 days",
+                 "All time": f"All time (since {first})"}.get(name, name)
+        section(label, in_period(rows, days, today), colors, a.full)
+    daily_chart(rows, a.days, colors, today)
+    projects_section(rows, "Top 10 projects (all time)")
+
+
+# ---------- interactive view ----------
+def tui(stdscr, rows, titles):
+    import curses
+    curses.curs_set(0)
+    curses.use_default_colors()
+    order = model_order(rows)
+    many = curses.COLORS >= 256
+    basic = [curses.COLOR_YELLOW, curses.COLOR_BLUE, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
+             curses.COLOR_CYAN, curses.COLOR_RED]
+    for i in range(6):
+        curses.init_pair(i + 1, PALETTE_256[i] if many else basic[i], -1)
+    curses.init_pair(7, curses.COLOR_GREEN, -1)
+    curses.init_pair(8, curses.COLOR_CYAN, -1)
+    mcol = {m: curses.color_pair(i % 6 + 1) for i, m in enumerate(order)}
+    GREEN, CYAN = curses.color_pair(7), curses.color_pair(8)
+    BOLD, DIM, REV = curses.A_BOLD, curses.A_DIM, curses.A_REVERSE
+
+    today = datetime.now().astimezone().date()
+    first = min((r["day"] for r in rows), default=today)
+    days = [first + timedelta(days=i) for i in range((today - first).days + 1)]
+    per_day = by_day(rows)
+    day_total = {d: sum(per_day[d].values()) for d in days}
+    day_top = max(day_total.values(), default=0) or 1
+
+    period, cursor, scroll, sessions, full = 1, len(days) - 1, 0, False, False
+    cache = {}
+
+    def put(y, x, s, attr=0, maxw=None):
+        h, w = stdscr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        room = w - x - (1 if y == h - 1 else 0)
+        if maxw is not None:
+            room = min(room, maxw)
+        if room > 0:
+            try:
+                stdscr.addstr(y, x, s[:room], attr)
+            except curses.error:
+                pass
+
+    def data(p):
+        if p not in cache:
+            pr = in_period(rows, PERIODS[p][1], today)
+            cache[p] = (pr, aggregate(pr), by_part(pr), by_key(pr, "proj"))
+        return cache[p]
+
+    def draw_models(y, x, w, agg):
+        put(y, x, "Models", BOLD)
+        if not agg:
+            put(y + 1, x, "no usage", DIM)
+            return 2
+        top = agg[0][1]["cost"] or 1
+        tokw = 34 if full else 0
+        barw = max(0, w - 13 - 6 - tokw - 11)
+        if full:
+            put(y, x + 19, f"{'input':>8}{'cache w':>9}{'cache r':>9}{'output':>8}", DIM)
+        for i, (m, a) in enumerate(agg):
+            yy = y + 1 + i
+            put(yy, x, f"{clip(short(m), 12):<13}", mcol[m])
+            put(yy, x + 13, f"{a['n']:>6}", DIM)
+            if full:
+                put(yy, x + 19, f"{fmt_tok(a['in']):>8}{fmt_tok(a['cw']):>9}{fmt_tok(a['cr']):>9}{fmt_tok(a['out']):>8}")
+            put(yy, x + 19 + tokw, f"{money(a['cost']):>10}", GREEN)
+            put(yy, x + 30 + tokw, bar(a["cost"] / top, barw), mcol[m])
+            if a["unpriced"]:
+                put(yy, x + 30 + tokw, "unpriced", DIM)
+        return 1 + len(agg)
+
+    def draw_parts(y, x, w, parts):
+        put(y, x, "Where the money goes", BOLD)
+        total = sum(v for _, v in parts) or 1
+        top = max((v for _, v in parts), default=0) or 1
+        barw = max(0, w - 13 - 10 - 6)
+        for i, (n, v) in enumerate(parts):
+            yy = y + 1 + i
+            put(yy, x, f"{n:<13}")
+            put(yy, x + 13, f"{money(v):>9}", GREEN)
+            put(yy, x + 22, f"{v / total:>5.0%}", DIM)
+            put(yy, x + 28, bar(v / top, barw), CYAN)
+        return 1 + len(parts)
+
+    def draw_daily(y, x, w, h):
+        nonlocal scroll
+        put(y, x, "Daily", BOLD)
+        legend_x = x + 7
+        for m in order:
+            if legend_x + len(short(m)) + 3 > x + w:
+                break
+            put(y, legend_x, "■", mcol[m])
+            put(y, legend_x + 2, short(m), DIM)
+            legend_x += len(short(m)) + 4
+        vis = max(1, h - 1)
+        scroll = max(0, min(scroll, len(days) - vis))
+        if cursor < scroll:
+            scroll = cursor
+        elif cursor >= scroll + vis:
+            scroll = cursor - vis + 1
+        pdays = PERIODS[period][1]
+        pstart = first if pdays is None else today - timedelta(days=pdays - 1)
+        barw = max(4, w - 13 - 10)
+        for i in range(vis):
+            idx = scroll + i
+            if idx >= len(days):
+                break
+            d, yy = days[idx], y + 1 + i
+            sel, inside = idx == cursor, days[idx] >= pstart
+            put(yy, x, "›" if sel else " ", BOLD)
+            put(yy, x + 2, f"{d:%a %m-%d}", (BOLD | REV) if sel else (0 if inside else DIM))
+            xx = x + 12
+            for m, n in stacked(per_day[d], order, day_top, barw):
+                put(yy, xx, "█" * n, mcol[m] | (0 if inside else DIM))
+                xx += n
+            tot = day_total[d]
+            put(yy, x + 12 + barw + 1, f"{money(tot):>9}", (GREEN if tot else DIM) | (0 if inside or not tot else DIM))
+        if scroll > 0:
+            put(y + 1, x + w - 1, "↑", DIM)
+        if scroll + vis < len(days):
+            put(y + vis, x + w - 1, "↓", DIM)
+
+    def draw_projects(y, x, w, h, projs):
+        put(y, x, "Top projects", BOLD)
+        projs = projs[:min(10, h - 1)]
+        if not projs:
+            put(y + 1, x, "no usage", DIM)
+            return
+        top = projs[0][1] or 1
+        barw = min(14, max(0, w - 30 - 11))
+        namew = max(8, w - 11 - barw - 1)
+        for i, (p, v) in enumerate(projs):
+            yy = y + 1 + i
+            put(yy, x, f"{clip_left(project_label(p), namew):<{namew}}")
+            put(yy, x + namew, f"{money(v):>10}", GREEN)
+            put(yy, x + namew + 11, bar(v / top, barw), CYAN)
+
+    def draw_sessions(y, x, w, h):
+        d = days[cursor]
+        sess = by_session(rows, d)
+        put(y, x, f"Sessions on {d:%a %b %-d}", BOLD)
+        put(y, x + 24, f"{len(sess)} · {money(day_total[d])}", DIM)
+        if not sess:
+            put(y + 1, x, "no usage that day", DIM)
+            return
+        room = h - 1
+        show = sess if len(sess) <= room else sess[:room - 1]
+        for i, (sid, s) in enumerate(show):
+            yy = y + 1 + i
+            name = project_label(s["proj"]).rstrip("/").split("/")[-1] or "~"
+            put(yy, x, f"{money(s['cost']):>8}", GREEN)
+            put(yy, x + 9, f"{clip(name, 14):<14}", CYAN)
+            put(yy, x + 24, clip(titles.get(sid, "(untitled)"), max(0, w - 24)))
+        if len(show) < len(sess):
+            rest = sum(s["cost"] for _, s in sess[len(show):])
+            put(y + 1 + len(show), x, f"{money(rest):>8} in {len(sess) - len(show)} more", DIM)
+
+    def draw():
+        stdscr.erase()
+        H, W = stdscr.getmaxyx()
+        if W < 48 or H < 14:
+            put(0, 0, "cc-cost: enlarge the terminal (48x14 minimum)")
+            stdscr.refresh()
+            return
+        pr, agg, parts, projs = data(period)
+        total = sum(r["cost"] for r in pr)
+        # header
+        put(0, 1, "cc-cost", BOLD)
+        x = 11
+        for i, (name, _) in enumerate(PERIODS):
+            put(0, x, f" {name} ", (BOLD | REV) if i == period else DIM)
+            x += len(name) + 3
+        tot = money(total)
+        put(0, W - len(tot) - 2, tot, BOLD | GREEN)
+        pdays = PERIODS[period][1]
+        start = first if pdays is None else max(first, today - timedelta(days=pdays - 1))
+        span = f"{today:%a %b %-d}" if pdays == 1 else f"{start:%b %-d} – {today:%b %-d}"
+        sub = f"{span} · {len(pr):,} requests"
+        put(1, W - len(sub) - 2, sub, DIM)
+
+        bottom = sessions and draw_sessions or (lambda y, x, w, h: draw_projects(y, x, w, h, projs))
+        y0, body_end = 3, H - 2
+        if W >= 88 and not full:
+            cw = (W - 5) // 2
+            rx = 1 + cw + 3
+            used = max(draw_models(y0, 1, cw, agg), draw_parts(y0, rx, cw, parts))
+            y1 = y0 + used + 1
+            draw_daily(y1, 1, cw, body_end - y1)
+            bottom(y1, rx, cw, body_end - y1)
+        elif W >= 88:
+            cw = (W - 5) // 2
+            rx = 1 + cw + 3
+            y1 = y0 + draw_models(y0, 1, W - 2, agg) + 1
+            draw_daily(y1, 1, cw, body_end - y1)
+            bottom(y1, rx, cw, body_end - y1)
+        else:
+            w = W - 2
+            y = y0 + draw_models(y0, 1, w, agg) + 1
+            if not full and body_end - y > 18:
+                y += draw_parts(y, 1, w, parts) + 1
+            rest = body_end - y
+            dh = max(4, rest // 2)
+            draw_daily(y, 1, w, dh)
+            if rest - dh - 1 >= 3:
+                bottom(y + dh + 1, 1, w, rest - dh - 1)
+        keys = [("←/→", "period"), ("↑/↓", "day"),
+                ("enter", "projects" if sessions else "sessions"),
+                ("f", "cost split" if full else "tokens"), ("q", "quit")]
+        x = 1
+        for k, label in keys:
+            put(H - 1, x, k, BOLD)
+            put(H - 1, x + len(k) + 1, label, DIM)
+            x += len(k) + len(label) + 4
+        stdscr.refresh()
+
+    while True:
+        draw()
+        try:
+            k = stdscr.getch()
+        except KeyboardInterrupt:
+            return
+        page = max(1, stdscr.getmaxyx()[0] - 12)
+        if k in (ord("q"), ord("Q")):
+            return
+        elif k in (curses.KEY_RIGHT, ord("l"), 9):
+            period = (period + 1) % len(PERIODS)
+        elif k in (curses.KEY_LEFT, ord("h"), curses.KEY_BTAB):
+            period = (period - 1) % len(PERIODS)
+        elif k in (curses.KEY_UP, ord("k")):
+            cursor = max(0, cursor - 1)
+        elif k in (curses.KEY_DOWN, ord("j")):
+            cursor = min(len(days) - 1, cursor + 1)
+        elif k == curses.KEY_PPAGE:
+            cursor = max(0, cursor - page)
+        elif k == curses.KEY_NPAGE:
+            cursor = min(len(days) - 1, cursor + page)
+        elif k in (ord("g"), curses.KEY_HOME):
+            cursor = 0
+        elif k in (ord("G"), curses.KEY_END):
+            cursor = len(days) - 1
+        elif k in (10, 13, curses.KEY_ENTER):
+            sessions = not sessions
+        elif k == 27:
+            sessions = False
+        elif k in (ord("f"), ord("F")):
+            full = not full
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--print", dest="static", action="store_true", help="static report instead of the interactive view")
+    ap.add_argument("--session", action="store_true", help="only the current session")
+    ap.add_argument("--full", action="store_true", help="add token columns (static report)")
+    ap.add_argument("--days", type=int, default=14, help="length of the daily chart (static report)")
+    ap.add_argument("--no-color", action="store_true")
+    a = ap.parse_args()
+    tty = sys.stdout.isatty()
+    if a.no_color or not tty and not os.environ.get("FORCE_COLOR"):
+        for k in C:
+            C[k] = ""
+
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
+    today = datetime.now().astimezone().date()
+
+    if a.session:
+        pdir = root / re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
+        latest = sorted(pdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        if not latest:
+            sys.exit(f"no transcripts found in {pdir}")
+        f = latest[-1]
+        rows, _ = load(root, [f] + list((pdir / f.stem).rglob("*.jsonl")))  # + its subagents
+        colors = {m: f"\033[38;5;{PALETTE_256[i % 6]}m" if C["r"] else "" for i, m in enumerate(model_order(rows))}
+        section(f"Current session ({f.stem[:8]}, incl. subagents)", rows, colors, a.full)
+    else:
+        rows, titles = load(root)
+        if tty and not a.static and rows:
+            import curses, locale
+            locale.setlocale(locale.LC_ALL, "")
+            os.environ.setdefault("ESCDELAY", "25")
+            curses.wrapper(tui, rows, titles)
+            return
+        report(rows, a, today)
+    print(f"\n{C['d']}Estimate at public first-party API list prices; excludes tokens not logged in local transcripts."
+          f"\nPeriods are calendar days in local time.{C['r']}")
+
+
+if __name__ == "__main__":
+    main()
