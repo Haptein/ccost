@@ -90,3 +90,7 @@ To keep the ledger current without running `ccost` yourself, the installer adds 
 - Prices are a table at the top of the script (first-party API list prices as of November 2026). Update it when prices change; models missing from the table are flagged as unpriced rather than skipped.
 - Only what your local transcripts held when the ledger last synced is counted. Sessions deleted before a sync and usage on other machines are not included.
 - It is an estimate of API-equivalent cost, not a bill.
+
+## License
+
+[MIT](LICENSE)
