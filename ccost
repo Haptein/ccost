@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""cc-cost: what your Claude Code usage would have cost at public API prices.
+"""ccost: what your Claude Code usage would have cost at public API prices.
 
 Reads the transcripts in ~/.claude/projects (including subagent transcripts),
 de-duplicates API responses by message id, and prices every token type
 separately: input, 5m/1h cache writes, cache reads, output, web searches.
 
-Every response it sees is recorded in its own ledger (~/.local/share/cc-cost),
+Every response it sees is recorded in its own ledger (~/.local/share/ccost),
 so history is kept after Claude Code deletes old transcripts.
 
-  cc-cost                 interactive view (in a terminal)
-  cc-cost --print         static report (also used when piped)
-  cc-cost --session       just the current session (latest transcript for $PWD)
-  cc-cost --sync          update the ledger and exit (for a session-end hook)
+  ccost                 interactive view (in a terminal)
+  ccost --print         static report (also used when piped)
+  ccost --session       just the current session (latest transcript for $PWD)
+  ccost --sync          update the ledger and exit (for a session-end hook)
 
 Static report options:
   --full                  add token columns (input, cache writes/reads, output)
@@ -187,11 +187,11 @@ def load_files(root, files):
 
 
 # ---------- ledger ----------
-# cc-cost keeps its own record of every response it has seen, so history survives
+# ccost keeps its own record of every response it has seen, so history survives
 # after Claude Code deletes old transcripts. Token counts are stored, not dollars,
 # so the whole history is repriced whenever the price table changes.
 def data_dir():
-    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "cc-cost"
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "ccost"
 
 
 def read_json(path, default):
@@ -593,13 +593,13 @@ def tui(stdscr, rows, titles):
         stdscr.erase()
         H, W = stdscr.getmaxyx()
         if W < 48 or H < 14:
-            put(0, 0, "cc-cost: enlarge the terminal (48x14 minimum)")
+            put(0, 0, "ccost: enlarge the terminal (48x14 minimum)")
             stdscr.refresh()
             return
         pr, agg, parts, projs = data(period)
         total = sum(r["cost"] for r in pr)
         # header
-        put(0, 1, "cc-cost", BOLD)
+        put(0, 1, "ccost", BOLD)
         x = 11
         for i, (name, _) in enumerate(PERIODS):
             put(0, x, f" {name} ", (BOLD | REV) if i == period else DIM)
@@ -700,7 +700,7 @@ def main():
     if a.sync:
         added = sync(root)[2]
         if tty:
-            print(f"cc-cost: {added} new responses recorded in {data_dir() / 'ledger.jsonl'}")
+            print(f"ccost: {added} new responses recorded in {data_dir() / 'ledger.jsonl'}")
         return
 
     if a.session:

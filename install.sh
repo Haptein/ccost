@@ -1,17 +1,17 @@
 #!/bin/sh
-# Install cc-cost on Linux or macOS.
+# Install ccost on Linux or macOS.
 #
-#   ./install.sh              install cc-cost and the Claude Code session-end hook
-#   ./install.sh --no-hook    install cc-cost only
+#   ./install.sh              install ccost and the Claude Code session-end hook
+#   ./install.sh --no-hook    install ccost only
 #   ./install.sh --uninstall  remove both (the ledger is kept)
 #
 # From a clone it links to the clone, so `git pull` updates it. Without one:
-#   curl -fsSL https://raw.githubusercontent.com/Haptein/cc-cost/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Haptein/ccost/main/install.sh | sh
 set -eu
 
-RAW="https://raw.githubusercontent.com/Haptein/cc-cost/main/cc-cost"
+RAW="https://raw.githubusercontent.com/Haptein/ccost/main/ccost"
 BIN_DIR="$HOME/.local/bin"
-TARGET="$BIN_DIR/cc-cost"
+TARGET="$BIN_DIR/ccost"
 SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 
 die() { echo "install.sh: $*" >&2; exit 1; }
@@ -30,7 +30,7 @@ except ValueError as e:
     sys.exit(f"install.sh: {path} is not valid JSON ({e}); hook left unchanged")
 
 groups = settings.get("hooks", {}).get("SessionEnd", [])
-kept = [g for g in groups if "cc-cost --sync" not in json.dumps(g)]
+kept = [g for g in groups if "ccost --sync" not in json.dumps(g)]
 if op == "add":
     if len(kept) < len(groups):
         sys.exit(0)  # already there
@@ -43,7 +43,7 @@ if not kept:
 
 os.makedirs(os.path.dirname(path), exist_ok=True)
 if os.path.exists(path):
-    shutil.copy2(path, path + ".bak-cc-cost")
+    shutil.copy2(path, path + ".bak-ccost")
 with open(path + ".tmp", "w", encoding="utf-8") as fh:
     json.dump(settings, fh, indent=2, ensure_ascii=False)
     fh.write("\n")
@@ -59,7 +59,7 @@ case "${1:-}" in
     --uninstall)
         rm -f "$TARGET" && echo "removed $TARGET"
         hook remove
-        echo "The ledger in ${XDG_DATA_HOME:-$HOME/.local/share}/cc-cost was kept."
+        echo "The ledger in ${XDG_DATA_HOME:-$HOME/.local/share}/ccost was kept."
         exit 0 ;;
     ""|--no-hook) ;;
     *) die "unknown option: $1" ;;
@@ -68,9 +68,9 @@ esac
 mkdir -p "$BIN_DIR"
 rm -f "$TARGET"
 here=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)
-if [ -f "$here/cc-cost" ]; then
-    chmod +x "$here/cc-cost"
-    ln -s "$here/cc-cost" "$TARGET"
+if [ -f "$here/ccost" ]; then
+    chmod +x "$here/ccost"
+    ln -s "$here/ccost" "$TARGET"
 else
     curl -fsSL "$RAW" -o "$TARGET" || die "download failed"
     chmod +x "$TARGET"
@@ -80,6 +80,6 @@ echo "installed $TARGET"
 [ "${1:-}" = --no-hook ] || hook add
 
 case ":$PATH:" in
-    *":$BIN_DIR:"*) echo "Done. Run: cc-cost" ;;
+    *":$BIN_DIR:"*) echo "Done. Run: ccost" ;;
     *) echo "Done. $BIN_DIR is not on your PATH: add it, or run $TARGET" ;;
 esac

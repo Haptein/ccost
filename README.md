@@ -1,11 +1,11 @@
-# cc-cost
+# ccost
 
 What your [Claude Code](https://claude.com/claude-code) usage would have cost at public API prices.
 
 It reads the session transcripts Claude Code keeps locally, counts each API response once, and prices every token type at its own rate. Single Python file, standard library only, nothing leaves your machine.
 
 ```
- cc-cost    Today   7 days   30 days   All time                               $42.10
+ ccost    Today   7 days   30 days   All time                               $42.10
                                                       Nov 17 – Nov 23 · 412 requests
 
  Models                                  Where the money goes
@@ -28,24 +28,24 @@ It reads the session transcripts Claude Code keeps locally, counts each API resp
 Requires Python 3.9+ on Linux or macOS.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Haptein/cc-cost/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Haptein/ccost/main/install.sh | sh
 ```
 
 Or from a clone, which links to it so `git pull` updates the tool:
 
 ```sh
-git clone https://github.com/Haptein/cc-cost && ./cc-cost/install.sh
+git clone https://github.com/Haptein/ccost && ./ccost/install.sh
 ```
 
-The installer puts `cc-cost` in `~/.local/bin` and adds a session-end hook to Claude Code's `settings.json` (see [Keeping history](#keeping-history)); the previous settings are saved next to it as `settings.json.bak-cc-cost`. Use `--no-hook` to skip the hook and `--uninstall` to remove both.
+The installer puts `ccost` in `~/.local/bin` and adds a session-end hook to Claude Code's `settings.json` (see [Keeping history](#keeping-history)); the previous settings are saved next to it as `settings.json.bak-ccost`. Use `--no-hook` to skip the hook and `--uninstall` to remove both.
 
 ## Usage
 
 ```sh
-cc-cost              # interactive view
-cc-cost --print      # static report (also what you get when piping)
-cc-cost --session    # only the current session (latest transcript for $PWD)
-cc-cost --sync       # update the ledger and exit (for the hook below)
+ccost              # interactive view
+ccost --print      # static report (also what you get when piping)
+ccost --session    # only the current session (latest transcript for $PWD)
+ccost --sync       # update the ledger and exit (for the hook below)
 ```
 
 Static report options: `--full` adds token columns, `--days N` sets the daily chart length, `--no-color`.
@@ -62,21 +62,21 @@ Static report options: `--full` adds token columns, `--days N` sets the daily ch
 
 ## Keeping history
 
-Claude Code deletes old transcripts after a while, so `cc-cost` keeps its own ledger in `~/.local/share/cc-cost/` (or `$XDG_DATA_HOME/cc-cost/`): one line per API response with its token counts, project and session. Every run adds what is new and reports from the ledger, so history stays after the transcripts are gone. Token counts are stored rather than dollars, so a price-table update reprices everything.
+Claude Code deletes old transcripts after a while, so `ccost` keeps its own ledger in `~/.local/share/ccost/` (or `$XDG_DATA_HOME/ccost/`): one line per API response with its token counts, project and session. Every run adds what is new and reports from the ledger, so history stays after the transcripts are gone. Token counts are stored rather than dollars, so a price-table update reprices everything.
 
-To keep the ledger current without running `cc-cost` yourself, the installer adds a session-end hook to `~/.claude/settings.json`. To add it by hand:
+To keep the ledger current without running `ccost` yourself, the installer adds a session-end hook to `~/.claude/settings.json`. To add it by hand:
 
 ```json
 {
   "hooks": {
     "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "~/.local/bin/cc-cost --sync >/dev/null 2>&1 || true" }] }
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/ccost --sync >/dev/null 2>&1 || true" }] }
     ]
   }
 }
 ```
 
-`cc-cost --sync` only reads what was appended since the last run, so it takes a fraction of a second. The ledger holds project paths and session titles; it stays on your machine.
+`ccost --sync` only reads what was appended since the last run, so it takes a fraction of a second. The ledger holds project paths and session titles; it stays on your machine.
 
 ## How it counts
 
