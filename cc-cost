@@ -5,9 +5,13 @@ Reads the transcripts in ~/.claude/projects (including subagent transcripts),
 de-duplicates API responses by message id, and prices every token type
 separately: input, 5m/1h cache writes, cache reads, output, web searches.
 
+Every response it sees is recorded in its own ledger (~/.local/share/cc-cost),
+so history is kept after Claude Code deletes old transcripts.
+
   cc-cost                 interactive view (in a terminal)
   cc-cost --print         static report (also used when piped)
   cc-cost --session       just the current session (latest transcript for $PWD)
+  cc-cost --sync          update the ledger and exit (for a session-end hook)
 
 Static report options:
   --full                  add token columns (input, cache writes/reads, output)
@@ -82,77 +86,187 @@ def price(model, u):
             searches * WEB_SEARCH_PER_REQ)
 
 
-# Project folder name -> real working directory, filled in by load(). The folder
-# name replaces every non-alphanumeric character with "-", so it can't be turned
-# back into a path on its own ("my-repo" and "my/repo" look the same).
-PROJECT_PATHS = {}
-
-
 def encode_path(path):
+    """Claude Code's project folder name for a working directory."""
     return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
-def project_label(dirname):
+def project_label(proj):
+    """proj is the real working directory when known, else the project folder name."""
     home = str(Path.home())
-    path = PROJECT_PATHS.get(dirname)
-    if path is None:  # no transcript line recorded it: best guess from the folder name
+    if not proj.startswith("/"):
+        # Folder name only. It replaces every non-alphanumeric character with "-",
+        # so this is a best guess ("my-repo" and "my/repo" look the same).
         enc = encode_path(home)
-        return "~" + dirname[len(enc):].replace("-", "/") if dirname.startswith(enc) else dirname
-    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+        return "~" + proj[len(enc):].replace("-", "/") if proj.startswith(enc) else proj
+    return "~" + proj[len(home):] if proj == home or proj.startswith(home + "/") else proj
 
 
-def load(root, only_files=None):
-    """Return (rows, titles). One row per distinct API response."""
-    msgs, titles = {}, {}
-    files = sorted(only_files or root.rglob("*.jsonl"))
-    for f in files:
-        proj = f.relative_to(root).parts[0]
-        try:
-            fh = open(f, encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        with fh:
-            for line in fh:
-                if '"usage"' not in line:
-                    if '-title"' in line or '"last-prompt"' in line:
-                        try:
-                            d = json.loads(line)
-                        except ValueError:
-                            continue
-                        rank, text = {"custom-title": (3, d.get("customTitle")),
-                                      "ai-title": (2, d.get("aiTitle")),
-                                      "last-prompt": (1, d.get("lastPrompt"))}.get(d.get("type"), (0, None))
-                        sid = d.get("sessionId")
-                        if text and sid and rank >= titles.get(sid, (0,))[0]:
-                            titles[sid] = (rank, " ".join(str(text).split()))
-                    continue
+# ---------- reading transcripts ----------
+def slim(u):
+    """The parts of a usage object that pricing needs."""
+    s = {k: u[k] for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                           "cache_creation_input_tokens") if u.get(k)}
+    cc = u.get("cache_creation")
+    if isinstance(cc, dict):
+        s["cache_creation"] = {k: cc.get(k) or 0 for k in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")}
+    if u.get("speed") == "fast":
+        s["speed"] = "fast"
+    searches = (u.get("server_tool_use") or {}).get("web_search_requests")
+    if searches:
+        s["server_tool_use"] = {"web_search_requests": searches}
+    return s
+
+
+def newer(prev, e):
+    return prev is None or (e["u"].get("output_tokens") or 0) > (prev["u"].get("output_tokens") or 0)
+
+
+def parse(lines, folder, stem, entries, titles):
+    """Read transcript lines into entries {message id: entry} and titles {session id: [rank, text]}."""
+    for line in lines:
+        if '"usage"' not in line:
+            if '-title"' in line or '"last-prompt"' in line:
                 try:
                     d = json.loads(line)
                 except ValueError:
                     continue
-                m = d.get("message")
-                if not isinstance(m, dict) or "usage" not in m:
-                    continue
-                model = base_model(m.get("model"))
-                if model == "<synthetic>" or not model:
-                    continue
-                mid = m.get("id") or d.get("requestId") or d.get("uuid")
-                u = m["usage"]
-                prev = msgs.get(mid)
-                if prev and (prev["u"].get("output_tokens") or 0) >= (u.get("output_tokens") or 0):
-                    continue
+                rank, text = {"custom-title": (3, d.get("customTitle")),
+                              "ai-title": (2, d.get("aiTitle")),
+                              "last-prompt": (1, d.get("lastPrompt"))}.get(d.get("type"), (0, None))
+                sid = d.get("sessionId")
+                if text and sid and rank >= titles.get(sid, (0,))[0]:
+                    titles[sid] = [rank, " ".join(str(text).split())[:200]]
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        m = d.get("message")
+        if not isinstance(m, dict) or not isinstance(m.get("usage"), dict):
+            continue
+        model = base_model(m.get("model"))
+        mid = m.get("id") or d.get("requestId") or d.get("uuid")
+        if model == "<synthetic>" or not model or not mid or not d.get("timestamp"):
+            continue
+        cwd = d.get("cwd")
+        e = {"id": mid, "t": d["timestamp"], "model": model, "u": slim(m["usage"]),
+             "proj": cwd if cwd and encode_path(cwd) == folder else folder,
+             "sid": d.get("sessionId") or stem}
+        if newer(entries.get(mid), e):
+            entries[mid] = e
+
+
+def to_rows(entries):
+    """Ledger entries -> priced rows, one per distinct API response."""
+    entries = list(entries)
+    paths = {encode_path(e["proj"]): e["proj"] for e in entries if e["proj"].startswith("/")}
+    rows = []
+    for e in entries:
+        try:
+            t = datetime.fromisoformat(e["t"].replace("Z", "+00:00")).astimezone()
+        except Exception:
+            continue
+        parts = price(e["model"], e["u"])
+        rows.append({"model": e["model"], "u": e["u"], "t": t, "day": t.date(),
+                     "proj": paths.get(e["proj"], e["proj"]), "sid": e["sid"],
+                     "parts": parts, "cost": sum(parts) if parts else 0.0})
+    return rows
+
+
+def load_files(root, files):
+    """Rows straight from the given transcript files, without the ledger."""
+    entries, titles = {}, {}
+    for f in sorted(files):
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                parse(fh, f.relative_to(root).parts[0], f.stem, entries, titles)
+        except OSError:
+            continue
+    return to_rows(entries.values())
+
+
+# ---------- ledger ----------
+# cc-cost keeps its own record of every response it has seen, so history survives
+# after Claude Code deletes old transcripts. Token counts are stored, not dollars,
+# so the whole history is repriced whenever the price table changes.
+def data_dir():
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "cc-cost"
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_ledger(path):
+    entries = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
                 try:
-                    t = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).astimezone()
-                except Exception:
+                    e = json.loads(line)
+                    if newer(entries.get(e["id"]), e):
+                        entries[e["id"]] = e
+                except (ValueError, KeyError, TypeError, AttributeError):
                     continue
-                cwd = d.get("cwd")
-                if proj not in PROJECT_PATHS and cwd and encode_path(cwd) == proj:
-                    PROJECT_PATHS[proj] = cwd
-                parts = price(model, u)
-                msgs[mid] = {"model": model, "u": u, "t": t, "day": t.date(), "proj": proj,
-                             "sid": d.get("sessionId") or f.stem,
-                             "parts": parts, "cost": sum(parts) if parts else 0.0}
-    return list(msgs.values()), {k: v[1] for k, v in titles.items()}
+    except OSError:
+        pass
+    return entries
+
+
+def sync(root):
+    """Record responses not yet in the ledger. Returns (entries, titles, number added)."""
+    import fcntl
+    d = data_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # two sessions may end at once
+        entries = read_ledger(d / "ledger.jsonl")
+        titles = read_json(d / "titles.json", {})
+        offsets = read_json(d / "state.json", {})  # transcript -> bytes already read
+        seen, fresh = {}, {}
+        for f in sorted(root.rglob("*.jsonl")):
+            key = str(f.relative_to(root))
+            try:
+                size = f.stat().st_size
+                off = offsets.get(key, 0)
+                if size < off:  # file was rewritten: read it again from the start
+                    off = 0
+                seen[key] = off
+                if size == off:
+                    continue
+                with open(f, "rb") as fh:
+                    fh.seek(off)
+                    data = fh.read()
+            except OSError:
+                continue
+            end = data.rfind(b"\n") + 1  # whole lines only; a partial last line waits for next time
+            if not end:
+                continue
+            found = {}
+            parse(data[:end].decode("utf-8", "replace").splitlines(), f.relative_to(root).parts[0], f.stem, found, titles)
+            for mid, e in found.items():
+                if newer(entries.get(mid), e):
+                    entries[mid] = fresh[mid] = e
+            seen[key] = off + end
+        if fresh:
+            with open(d / "ledger.jsonl", "a", encoding="utf-8") as fh:
+                for e in fresh.values():
+                    fh.write(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n")
+        write_json(d / "titles.json", titles)
+        write_json(d / "state.json", seen)
+    return entries, titles, len(fresh)
 
 
 # ---------- aggregation ----------
@@ -569,6 +683,7 @@ def tui(stdscr, rows, titles):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--print", dest="static", action="store_true", help="static report instead of the interactive view")
+    ap.add_argument("--sync", action="store_true", help="update the ledger and exit (for hooks)")
     ap.add_argument("--session", action="store_true", help="only the current session")
     ap.add_argument("--full", action="store_true", help="add token columns (static report)")
     ap.add_argument("--days", type=int, default=14, help="length of the daily chart (static report)")
@@ -582,17 +697,24 @@ def main():
     root = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
     today = datetime.now().astimezone().date()
 
+    if a.sync:
+        added = sync(root)[2]
+        if tty:
+            print(f"cc-cost: {added} new responses recorded in {data_dir() / 'ledger.jsonl'}")
+        return
+
     if a.session:
         pdir = root / encode_path(os.getcwd())
         latest = sorted(pdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
         if not latest:
             sys.exit(f"no transcripts found in {pdir}")
         f = latest[-1]
-        rows, _ = load(root, [f] + list((pdir / f.stem).rglob("*.jsonl")))  # + its subagents
+        rows = load_files(root, [f] + list((pdir / f.stem).rglob("*.jsonl")))  # + its subagents
         colors = {m: f"\033[38;5;{PALETTE_256[i % 6]}m" if C["r"] else "" for i, m in enumerate(model_order(rows))}
         section(f"Current session ({f.stem[:8]}, incl. subagents)", rows, colors, a.full)
     else:
-        rows, titles = load(root)
+        entries, titles, _ = sync(root)
+        rows, titles = to_rows(entries.values()), {k: v[1] for k, v in titles.items()}
         if tty and not a.static and rows:
             import curses, locale
             locale.setlocale(locale.LC_ALL, "")
@@ -600,7 +722,7 @@ def main():
             curses.wrapper(tui, rows, titles)
             return
         report(rows, a, today)
-    print(f"\n{C['d']}Estimate at public first-party API list prices; excludes tokens not logged in local transcripts."
+    print(f"\n{C['d']}Estimate at public first-party API list prices; covers what local transcripts and the ledger recorded."
           f"\nPeriods are calendar days in local time.{C['r']}")
 
 
