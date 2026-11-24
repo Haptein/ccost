@@ -82,9 +82,23 @@ def price(model, u):
             searches * WEB_SEARCH_PER_REQ)
 
 
+# Project folder name -> real working directory, filled in by load(). The folder
+# name replaces every non-alphanumeric character with "-", so it can't be turned
+# back into a path on its own ("my-repo" and "my/repo" look the same).
+PROJECT_PATHS = {}
+
+
+def encode_path(path):
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
 def project_label(dirname):
-    home = str(Path.home()).replace("/", "-")
-    return "~" + dirname[len(home):].replace("-", "/") if dirname.startswith(home) else dirname
+    home = str(Path.home())
+    path = PROJECT_PATHS.get(dirname)
+    if path is None:  # no transcript line recorded it: best guess from the folder name
+        enc = encode_path(home)
+        return "~" + dirname[len(enc):].replace("-", "/") if dirname.startswith(enc) else dirname
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
 
 
 def load(root, only_files=None):
@@ -131,6 +145,9 @@ def load(root, only_files=None):
                     t = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).astimezone()
                 except Exception:
                     continue
+                cwd = d.get("cwd")
+                if proj not in PROJECT_PATHS and cwd and encode_path(cwd) == proj:
+                    PROJECT_PATHS[proj] = cwd
                 parts = price(model, u)
                 msgs[mid] = {"model": model, "u": u, "t": t, "day": t.date(), "proj": proj,
                              "sid": d.get("sessionId") or f.stem,
@@ -566,7 +583,7 @@ def main():
     today = datetime.now().astimezone().date()
 
     if a.session:
-        pdir = root / re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
+        pdir = root / encode_path(os.getcwd())
         latest = sorted(pdir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
         if not latest:
             sys.exit(f"no transcripts found in {pdir}")
