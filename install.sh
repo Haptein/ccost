@@ -66,16 +66,19 @@ case "${1:-}" in
 esac
 
 mkdir -p "$BIN_DIR"
-rm -f "$TARGET"
+verb=installed
+[ -e "$TARGET" ] && verb=updated
 here=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)
-if [ -f "$here/ccost" ]; then
+if [ -f "$here/ccost" ] && [ -f "$here/install.sh" ]; then
     chmod +x "$here/ccost"
-    ln -s "$here/ccost" "$TARGET"
+    ln -sf "$here/ccost" "$TARGET"
 else
-    curl -fsSL "$RAW" -o "$TARGET" || die "download failed"
-    chmod +x "$TARGET"
+    # Download next to the target first, so a failed update keeps the old version.
+    curl -fsSL "$RAW" -o "$TARGET.new" || { rm -f "$TARGET.new"; die "download failed; nothing changed"; }
+    chmod +x "$TARGET.new"
+    mv -f "$TARGET.new" "$TARGET"
 fi
-echo "installed $TARGET"
+echo "$verb $TARGET"
 
 [ "${1:-}" = --no-hook ] || hook add
 
