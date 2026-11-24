@@ -28,9 +28,16 @@ It reads the session transcripts Claude Code keeps locally, counts each API resp
 Requires Python 3.9+ on Linux or macOS.
 
 ```sh
-git clone https://github.com/Haptein/cc-cost
-ln -s "$PWD/cc-cost/cc-cost" ~/.local/bin/cc-cost
+curl -fsSL https://raw.githubusercontent.com/Haptein/cc-cost/main/install.sh | sh
 ```
+
+Or from a clone, which links to it so `git pull` updates the tool:
+
+```sh
+git clone https://github.com/Haptein/cc-cost && ./cc-cost/install.sh
+```
+
+The installer puts `cc-cost` in `~/.local/bin` and adds a session-end hook to Claude Code's `settings.json` (see [Keeping history](#keeping-history)); the previous settings are saved next to it as `settings.json.bak-cc-cost`. Use `--no-hook` to skip the hook and `--uninstall` to remove both.
 
 ## Usage
 
@@ -38,6 +45,7 @@ ln -s "$PWD/cc-cost/cc-cost" ~/.local/bin/cc-cost
 cc-cost              # interactive view
 cc-cost --print      # static report (also what you get when piping)
 cc-cost --session    # only the current session (latest transcript for $PWD)
+cc-cost --sync       # update the ledger and exit (for the hook below)
 ```
 
 Static report options: `--full` adds token columns, `--days N` sets the daily chart length, `--no-color`.
@@ -52,6 +60,24 @@ Static report options: `--full` adds token columns, `--days N` sets the daily ch
 | `f` | Swap the cost split for token columns |
 | `q` | Quit |
 
+## Keeping history
+
+Claude Code deletes old transcripts after a while, so `cc-cost` keeps its own ledger in `~/.local/share/cc-cost/` (or `$XDG_DATA_HOME/cc-cost/`): one line per API response with its token counts, project and session. Every run adds what is new and reports from the ledger, so history stays after the transcripts are gone. Token counts are stored rather than dollars, so a price-table update reprices everything.
+
+To keep the ledger current without running `cc-cost` yourself, the installer adds a session-end hook to `~/.claude/settings.json`. To add it by hand:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/cc-cost --sync >/dev/null 2>&1 || true" }] }
+    ]
+  }
+}
+```
+
+`cc-cost --sync` only reads what was appended since the last run, so it takes a fraction of a second. The ledger holds project paths and session titles; it stays on your machine.
+
 ## How it counts
 
 - **Source:** `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`), subagent transcripts included.
@@ -62,5 +88,5 @@ Static report options: `--full` adds token columns, `--days N` sets the daily ch
 ## Limits
 
 - Prices are a table at the top of the script (first-party API list prices as of November 2026). Update it when prices change; models missing from the table are flagged as unpriced rather than skipped.
-- Only what is in your local transcripts is counted. Deleted sessions and usage on other machines are not included.
+- Only what your local transcripts held when the ledger last synced is counted. Sessions deleted before a sync and usage on other machines are not included.
 - It is an estimate of API-equivalent cost, not a bill.
