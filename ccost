@@ -436,11 +436,10 @@ def report(rows, a, today):
 
 
 # ---------- interactive view ----------
-def tui(stdscr, rows, titles):
+def tui(stdscr, load, rows, titles):
     import curses
     curses.curs_set(0)
     curses.use_default_colors()
-    order = model_order(rows)
     many = curses.COLORS >= 256
     basic = [curses.COLOR_YELLOW, curses.COLOR_BLUE, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
              curses.COLOR_CYAN, curses.COLOR_RED]
@@ -448,19 +447,30 @@ def tui(stdscr, rows, titles):
         curses.init_pair(i + 1, PALETTE_256[i] if many else basic[i], -1)
     curses.init_pair(7, curses.COLOR_GREEN, -1)
     curses.init_pair(8, curses.COLOR_CYAN, -1)
-    mcol = {m: curses.color_pair(i % 6 + 1) for i, m in enumerate(order)}
     GREEN, CYAN = curses.color_pair(7), curses.color_pair(8)
     BOLD, DIM, REV = curses.A_BOLD, curses.A_DIM, curses.A_REVERSE
 
-    today = datetime.now().astimezone().date()
-    first = min((r["day"] for r in rows), default=today)
-    days = [first + timedelta(days=i) for i in range((today - first).days + 1)]
-    per_day = by_day(rows)
-    day_total = {d: sum(per_day[d].values()) for d in days}
-    day_top = max(day_total.values(), default=0) or 1
+    order = mcol = today = first = per_day = day_total = day_top = updated = None
+    days, cache, cursor = [], {}, 0
 
-    period, cursor, scroll, sessions, full = 1, len(days) - 1, 0, False, False
-    cache = {}
+    def prepare():
+        """Derive everything the view shows from rows; called at start and on refresh."""
+        nonlocal order, mcol, today, first, days, per_day, day_total, day_top, updated, cursor
+        selected = days[cursor] if days and cursor < len(days) - 1 else None  # None: follow today
+        order = model_order(rows)
+        mcol = {m: curses.color_pair(i % 6 + 1) for i, m in enumerate(order)}
+        updated = datetime.now().astimezone()
+        today = updated.date()
+        first = min((r["day"] for r in rows), default=today)
+        days = [first + timedelta(days=i) for i in range((today - first).days + 1)]
+        per_day = by_day(rows)
+        day_total = {d: sum(per_day[d].values()) for d in days}
+        day_top = max(day_total.values(), default=0) or 1
+        cursor = days.index(selected) if selected in days else len(days) - 1
+        cache.clear()
+
+    prepare()
+    period, scroll, sessions, full = 1, 0, False, False
 
     def put(y, x, s, attr=0, maxw=None):
         h, w = stdscr.getmaxyx()
@@ -639,12 +649,15 @@ def tui(stdscr, rows, titles):
                 bottom(y + dh + 1, 1, w, rest - dh - 1)
         keys = [("←/→", "period"), ("↑/↓", "day"),
                 ("enter", "projects" if sessions else "sessions"),
-                ("f", "cost split" if full else "tokens"), ("q", "quit")]
+                ("f", "cost split" if full else "tokens"), ("r", "refresh"), ("q", "quit")]
         x = 1
         for k, label in keys:
             put(H - 1, x, k, BOLD)
             put(H - 1, x + len(k) + 1, label, DIM)
             x += len(k) + len(label) + 4
+        stamp = f"updated {updated:%H:%M:%S}"
+        if x + len(stamp) + 2 <= W:
+            put(H - 1, W - len(stamp) - 2, stamp, DIM)
         stdscr.refresh()
 
     while True:
@@ -678,6 +691,9 @@ def tui(stdscr, rows, titles):
             sessions = False
         elif k in (ord("f"), ord("F")):
             full = not full
+        elif k in (ord("r"), ord("R")):
+            rows, titles = load()
+            prepare()
 
 
 def main():
@@ -713,13 +729,16 @@ def main():
         colors = {m: f"\033[38;5;{PALETTE_256[i % 6]}m" if C["r"] else "" for i, m in enumerate(model_order(rows))}
         section(f"Current session ({f.stem[:8]}, incl. subagents)", rows, colors, a.full)
     else:
-        entries, titles, _ = sync(root)
-        rows, titles = to_rows(entries.values()), {k: v[1] for k, v in titles.items()}
+        def load():
+            entries, titles, _ = sync(root)
+            return to_rows(entries.values()), {k: v[1] for k, v in titles.items()}
+
+        rows, titles = load()
         if tty and not a.static and rows:
             import curses, locale
             locale.setlocale(locale.LC_ALL, "")
             os.environ.setdefault("ESCDELAY", "25")
-            curses.wrapper(tui, rows, titles)
+            curses.wrapper(tui, load, rows, titles)
             return
         report(rows, a, today)
     print(f"\n{C['d']}Estimate at public first-party API list prices; covers what local transcripts and the ledger recorded."
