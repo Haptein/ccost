@@ -89,7 +89,7 @@ Shows the same limits as `/usage` (the 5-hour session, the weekly limit and any 
 
 - **Off by default**, because it reads that token. `ccost --limits off` turns it off again.
 - **Never refreshes the token**, so it can't interfere with Claude Code's sign-in. While the token is expired, ccost keeps showing the last values with their age; opening Claude Code renews it.
-- **Updated** on every run, on `r`, and by the session-end hook.
+- **Updated** when you open ccost and on `r`, at most once a minute. The session-end hook doesn't fetch them.
 - The endpoint is internal to Claude Code and may change without notice.
 
 ## How it counts

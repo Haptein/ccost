@@ -943,7 +943,6 @@ def main():
         return
 
     if a.sync:
-        update_limits()
         added = sync(root)[2]
         if tty:
             print(f"ccost: {added} new responses recorded in {data_dir() / 'ledger.jsonl'}")
