@@ -325,7 +325,8 @@ def by_session(rows, day):
 
 
 def model_order(rows):
-    return [m for m, _ in by_key(rows, "model")]
+    """Models in a fixed order, most expensive first, so stacks and legends don't reshuffle."""
+    return sorted({r["model"] for r in rows}, key=lambda m: (-PRICES.get(m, (0, 0))[1], m))
 
 
 def stacked(day_costs, order, top, width):
@@ -373,7 +374,40 @@ def clip(s, w):
 
 # ---------- static report ----------
 C = {"b": "\033[1m", "d": "\033[2m", "r": "\033[0m", "g": "\033[32m", "y": "\033[33m", "c": "\033[36m"}
-PALETTE_256 = [208, 75, 114, 177, 221, 203]
+# A fixed colour per model (256-colour palette), so it never changes between runs.
+# Each family has its own hue, picked to contrast with the others (Fable violet,
+# Opus amber, Sonnet teal, Haiku green), and each version its own shade of it, so
+# e.g. Fable 5.1 and 5.2 are easy to tell apart. Colours are not tied to price.
+MODEL_COLORS = {
+    "claude-fable-5-2": 105, "claude-mythos-5-2": 105,   # periwinkle
+    "claude-fable-5-1": 176, "claude-mythos-5-1": 176,   # orchid
+    "claude-fable-5": 133, "claude-mythos-5": 133,       # dark orchid
+    "claude-opus-5-5": 215,                              # light amber
+    "claude-opus-5": 173,                                # terracotta
+    "claude-opus-4-8": 137, "claude-opus-4-7": 137, "claude-opus-4-6": 137,  # tan
+    "claude-sonnet-5-5": 80,                             # teal
+    "claude-sonnet-5": 37,                               # dark teal
+    "claude-sonnet-4-6": 30,                             # deep teal
+    "claude-haiku-5-5": 114,                             # green
+    "claude-haiku-4-5": 71,                              # dark green
+}
+# Colour for models not in the table yet: their family's newest shade.
+FAMILY_COLORS = {"fable": 105, "mythos": 105, "opus": 215, "sonnet": 80, "haiku": 114}
+# Nearest of the 8 basic colours, for terminals without 256.
+BASIC = {105: "BLUE", 176: "MAGENTA", 133: "MAGENTA", 215: "YELLOW", 173: "YELLOW", 137: "YELLOW",
+         80: "CYAN", 37: "CYAN", 30: "CYAN", 114: "GREEN", 71: "GREEN"}
+
+
+def model_color(m):
+    """256-colour index for a model: its own shade, else its family's, else grey."""
+    if m in MODEL_COLORS:
+        return MODEL_COLORS[m]
+    fam = re.search(r"(fable|mythos|opus|sonnet|haiku)", m)
+    return FAMILY_COLORS[fam.group(1)] if fam else 245
+
+
+def ansi_colors(rows):
+    return {m: f"\033[38;5;{model_color(m)}m" if C["r"] else "" for m in model_order(rows)}
 
 
 def section(title, rows, colors, full=False, width=14):
@@ -424,8 +458,7 @@ def projects_section(rows, title, top_n=10, width=14):
 
 
 def report(rows, a, today):
-    colors = {m: f"\033[38;5;{PALETTE_256[i % len(PALETTE_256)]}m" if C["r"] else ""
-              for i, m in enumerate(model_order(rows))}
+    colors = ansi_colors(rows)
     first = min((r["day"] for r in rows), default=today)
     for name, days in PERIODS:
         label = {"7 days": "Last 7 days", "30 days": "Last 30 days",
@@ -441,10 +474,16 @@ def tui(stdscr, load, rows, titles):
     curses.curs_set(0)
     curses.use_default_colors()
     many = curses.COLORS >= 256
-    basic = [curses.COLOR_YELLOW, curses.COLOR_BLUE, curses.COLOR_GREEN, curses.COLOR_MAGENTA,
-             curses.COLOR_CYAN, curses.COLOR_RED]
-    for i in range(6):
-        curses.init_pair(i + 1, PALETTE_256[i] if many else basic[i], -1)
+    pairs = {}
+
+    def color_attr(m):
+        c = model_color(m)
+        fg = c if many else getattr(curses, "COLOR_" + BASIC.get(c, "WHITE"))
+        if fg not in pairs:
+            pairs[fg] = 10 + len(pairs)
+            curses.init_pair(pairs[fg], fg, -1)
+        return curses.color_pair(pairs[fg])
+
     curses.init_pair(7, curses.COLOR_GREEN, -1)
     curses.init_pair(8, curses.COLOR_CYAN, -1)
     GREEN, CYAN = curses.color_pair(7), curses.color_pair(8)
@@ -458,7 +497,7 @@ def tui(stdscr, load, rows, titles):
         nonlocal order, mcol, today, first, days, per_day, day_total, day_top, updated, cursor
         selected = days[cursor] if days and cursor < len(days) - 1 else None  # None: follow today
         order = model_order(rows)
-        mcol = {m: curses.color_pair(i % 6 + 1) for i, m in enumerate(order)}
+        mcol = {m: color_attr(m) for m in order}
         updated = datetime.now().astimezone()
         today = updated.date()
         first = min((r["day"] for r in rows), default=today)
@@ -726,7 +765,7 @@ def main():
             sys.exit(f"no transcripts found in {pdir}")
         f = latest[-1]
         rows = load_files(root, [f] + list((pdir / f.stem).rglob("*.jsonl")))  # + its subagents
-        colors = {m: f"\033[38;5;{PALETTE_256[i % 6]}m" if C["r"] else "" for i, m in enumerate(model_order(rows))}
+        colors = ansi_colors(rows)
         section(f"Current session ({f.stem[:8]}, incl. subagents)", rows, colors, a.full)
     else:
         def load():
