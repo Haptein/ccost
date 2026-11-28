@@ -688,7 +688,7 @@ def tui(stdscr, load, rows, titles):
                 bottom(y + dh + 1, 1, w, rest - dh - 1)
         keys = [("←/→", "period"), ("↑/↓", "day"),
                 ("enter", "projects" if sessions else "sessions"),
-                ("f", "cost split" if full else "tokens"), ("r", "refresh"), ("q", "quit")]
+                ("t", "cost split" if full else "tokens"), ("r", "refresh"), ("q", "quit")]
         x = 1
         for k, label in keys:
             put(H - 1, x, k, BOLD)
@@ -728,7 +728,7 @@ def tui(stdscr, load, rows, titles):
             sessions = not sessions
         elif k == 27:
             sessions = False
-        elif k in (ord("f"), ord("F")):
+        elif k in (ord("t"), ord("T")):
             full = not full
         elif k in (ord("r"), ord("R")):
             rows, titles = load()

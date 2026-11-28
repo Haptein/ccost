@@ -57,7 +57,7 @@ Static report options: `--full` adds token columns, `--days N` sets the daily ch
 | `←` `→` / Tab | Cycle period: Today, 7 days, 30 days, All time |
 | `↑` `↓` / PgUp PgDn / `g` `G` | Move through the daily chart |
 | Enter | Show the selected day's sessions, most expensive first (Enter or Esc to go back) |
-| `f` | Swap the cost split for token columns |
+| `t` | Swap the cost split for token columns |
 | `r` | Refresh with the latest usage |
 | `q` | Quit |
 
