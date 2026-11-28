@@ -269,6 +269,153 @@ def sync(root):
     return entries, titles, len(fresh)
 
 
+# ---------- plan limits ----------
+# Optional (`ccost --limits on`): the session and weekly limits /usage shows, read
+# from the same endpoint with the token Claude Code stores. The token is only used
+# while it is valid and is never refreshed, so ccost can't interfere with Claude
+# Code's sign-in. The endpoint is internal to Claude Code and may change.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def claude_dir():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def config():
+    return read_json(data_dir() / "config.json", {})
+
+
+def set_config(**kw):
+    d = data_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    write_json(d / "config.json", {**config(), **kw})
+
+
+def read_token():
+    """Claude Code's OAuth credentials: a file on Linux, the Keychain on macOS."""
+    try:
+        with open(claude_dir() / ".credentials.json", encoding="utf-8") as fh:
+            return json.load(fh).get("claudeAiOauth")
+    except (OSError, ValueError, AttributeError):
+        pass
+    if sys.platform == "darwin":
+        import subprocess
+        for extra in (["-a", os.environ.get("USER", "")], []):
+            try:
+                out = subprocess.run(["security", "find-generic-password", *extra, "-w", "-s", "Claude Code-credentials"],
+                                     capture_output=True, text=True, timeout=5)
+                if out.returncode == 0:
+                    return json.loads(out.stdout).get("claudeAiOauth")
+            except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+                continue
+    return None
+
+
+def fetch_limits():
+    """Save the current plan limits to limits.json. Returns an error message, or None."""
+    import time, urllib.request
+    o = read_token() or {}
+    if not o.get("accessToken"):
+        return "not signed in to Claude Code with a subscription"
+    if (o.get("expiresAt") or 0) / 1000 < time.time() + 30:
+        return "Claude Code's sign-in token has expired; open Claude Code to renew it"
+    req = urllib.request.Request(USAGE_URL, headers={"Authorization": "Bearer " + o["accessToken"],
+                                                     "anthropic-beta": "oauth-2025-04-20", "User-Agent": "ccost"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.load(r)
+    except Exception as e:
+        code = getattr(e, "code", None)
+        if code == 429:
+            return "the limits endpoint is rate limiting requests; showing the last values"
+        return f"couldn't fetch limits ({'HTTP ' + str(code) if code else e.__class__.__name__})"
+    limits = []
+    for l in data.get("limits") or []:
+        kind, scope = l.get("kind"), (l.get("scope") or {})
+        name = ((scope.get("model") or {}).get("display_name") or (scope.get("surface") or {}).get("display_name")
+                if isinstance(scope, dict) else None)
+        label = {"session": "5h", "weekly_all": "week"}.get(kind) or (name or kind or "").lower()
+        if l.get("percent") is not None:
+            limits.append({"label": label, "percent": l["percent"], "resets_at": l.get("resets_at")})
+    if not limits:  # older response shape
+        for key, label in (("five_hour", "5h"), ("seven_day", "week")):
+            v = data.get(key) or {}
+            if v.get("utilization") is not None:
+                limits.append({"label": label, "percent": v["utilization"], "resets_at": v.get("resets_at")})
+    d = data_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    write_json(d / "limits.json", {"fetched_at": datetime.now().astimezone().isoformat(), "limits": limits})
+    return None
+
+
+def update_limits():
+    """Refresh the limits, at most once a minute: the endpoint rate limits frequent callers."""
+    if not config().get("limits"):
+        return
+    path = data_dir() / "limits.json"
+    lim = read_json(path, {})
+    last = max(filter(None, (parse_time(lim.get(k) or "") for k in ("fetched_at", "tried_at"))), default=None)
+    now = datetime.now().astimezone()
+    if last and (now - last).total_seconds() < 60:
+        return
+    if fetch_limits():  # failed: keep the last values, and remember the attempt
+        write_json(path, {**read_json(path, {}), "tried_at": now.isoformat()})
+
+
+def read_limits():
+    if not config().get("limits"):
+        return None
+    return read_json(data_dir() / "limits.json", None)
+
+
+def parse_time(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone()
+    except Exception:
+        return None
+
+
+def limit_segments(lim, now, ref=None):
+    """The limits line as [(text, percent or None)]: text with a percent is coloured by it,
+    the rest is dim. Limits that reset together share one field, e.g.
+    "5h 14% · 55m     week 8% / fable 14% · Thu 16:00"."""
+    groups = []  # [reset time, [(label, percent)]]
+    for l in (lim or {}).get("limits", []):
+        reset = parse_time(l.get("resets_at") or "")
+        if reset:
+            reset = (reset + timedelta(seconds=30)).replace(second=0, microsecond=0)  # 15:59:59.9 -> 16:00
+        label = str(l.get("label", "")).lower().replace(" week", "")
+        for g in groups:
+            if g[0] == reset and reset is not None:
+                g[1].append((label, l.get("percent")))
+                break
+        else:
+            groups.append([reset, [(label, l.get("percent"))]])
+    segs = []
+    for reset, parts in groups:
+        if segs:
+            segs.append(("     ", None))
+        over = reset is not None and reset <= now  # window ended since the last update
+        for i, (label, pct) in enumerate(parts):
+            segs.append(((" / " if i else "") + label + " ", None))
+            segs.append(("reset", None) if over or pct is None else (f"{float(pct):.0f}%", float(pct)))
+        if reset and not over:
+            mins = int((reset - now).total_seconds() // 60)
+            when = (f"{mins}m" if mins < 60 else f"{mins // 60}h{mins % 60:02d}m" if mins < 1440
+                    else f"{reset:%a %H:%M}")
+            segs.append((" · " + when, None))
+    fetched = parse_time((lim or {}).get("fetched_at") or "")
+    # Say how old the limits are only when they lag behind `ref` (the moment the rest was loaded).
+    lag = (ref or now) - fetched if fetched else timedelta(0)
+    if segs and lag >= timedelta(minutes=5):
+        segs.append(("     " + ago(int((now - fetched).total_seconds() // 60)), None))
+    return segs
+
+
+def ago(mins):
+    return "just now" if mins < 1 else f"{mins}m ago" if mins < 60 else f"{mins // 60}h ago" if mins < 1440 else f"{mins // 1440}d ago"
+
+
 # ---------- aggregation ----------
 def in_period(rows, days, today):
     if days is None:
@@ -457,7 +604,19 @@ def projects_section(rows, title, top_n=10, width=14):
         print(f"  {clip_left(project_label(p), 34):<34} {C['g']}{money(v):>10}{C['r']} {C['c']}{bar(v/top, width)}{C['r']}")
 
 
+def limits_section():
+    segs = limit_segments(read_limits(), datetime.now().astimezone())
+    if not segs:
+        return
+    out = ""
+    for text, pct in segs:
+        col = C["d"] if pct is None else C["g"] if pct < 60 else C["y"] if pct < 85 else ("\033[31m" if C["r"] else "")
+        out += f"{col}{text}{C['r']}"
+    print(f"\n{out}")
+
+
 def report(rows, a, today):
+    limits_section()
     colors = ansi_colors(rows)
     first = min((r["day"] for r in rows), default=today)
     for name, days in PERIODS:
@@ -470,6 +629,7 @@ def report(rows, a, today):
 
 # ---------- interactive view ----------
 def tui(stdscr, load, rows, titles):
+    limits = read_limits()
     import curses
     curses.curs_set(0)
     curses.use_default_colors()
@@ -486,6 +646,9 @@ def tui(stdscr, load, rows, titles):
 
     curses.init_pair(7, curses.COLOR_GREEN, -1)
     curses.init_pair(8, curses.COLOR_CYAN, -1)
+    curses.init_pair(5, curses.COLOR_YELLOW, -1)
+    curses.init_pair(6, curses.COLOR_RED, -1)
+    YELLOW, RED = curses.color_pair(5), curses.color_pair(6)
     GREEN, CYAN = curses.color_pair(7), curses.color_pair(8)
     BOLD, DIM, REV = curses.A_BOLD, curses.A_DIM, curses.A_REVERSE
 
@@ -638,6 +801,16 @@ def tui(stdscr, load, rows, titles):
             rest = sum(s["cost"] for _, s in sess[len(show):])
             put(y + 1 + len(show), x, f"{money(rest):>8} in {len(sess) - len(show)} more", DIM)
 
+    def draw_limits(y, x, room):
+        """The limits line; returns the column where it ended."""
+        segs = limit_segments(limits, datetime.now().astimezone(), updated)
+        if sum(len(t) for t, _ in segs) > room:
+            return x
+        for text, pct in segs:
+            put(y, x, text, DIM if pct is None else RED if pct >= 85 else YELLOW if pct >= 60 else GREEN)
+            x += len(text)
+        return x
+
     def draw():
         stdscr.erase()
         H, W = stdscr.getmaxyx()
@@ -662,7 +835,12 @@ def tui(stdscr, load, rows, titles):
         put(1, W - len(sub) - 2, sub, DIM)
 
         bottom = sessions and draw_sessions or (lambda y, x, w, h: draw_projects(y, x, w, h, projs))
-        y0, body_end = 3, H - 2
+        # Status line above the keys: what is true right now, whatever period is selected.
+        stamp = f"updated {updated:%H:%M:%S}"
+        status = draw_limits(H - 2, 1, W - 3) > 1
+        if status and sum(len(t) for t, _ in limit_segments(limits, datetime.now().astimezone(), updated)) + len(stamp) + 5 <= W:
+            put(H - 2, W - len(stamp) - 2, stamp, DIM)
+        y0, body_end = 3, H - (3 if status else 2)
         if W >= 88 and not full:
             cw = (W - 5) // 2
             rx = 1 + cw + 3
@@ -694,8 +872,7 @@ def tui(stdscr, load, rows, titles):
             put(H - 1, x, k, BOLD)
             put(H - 1, x + len(k) + 1, label, DIM)
             x += len(k) + len(label) + 4
-        stamp = f"updated {updated:%H:%M:%S}"
-        if x + len(stamp) + 2 <= W:
+        if not status and x + len(stamp) + 2 <= W:
             put(H - 1, W - len(stamp) - 2, stamp, DIM)
         stdscr.refresh()
 
@@ -732,6 +909,8 @@ def tui(stdscr, load, rows, titles):
             full = not full
         elif k in (ord("r"), ord("R")):
             rows, titles = load()
+            update_limits()
+            limits = read_limits()
             prepare()
 
 
@@ -743,6 +922,8 @@ def main():
     ap.add_argument("--full", action="store_true", help="add token columns (static report)")
     ap.add_argument("--days", type=int, default=14, help="length of the daily chart (static report)")
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--limits", choices=("on", "off"),
+                    help="show your plan's 5h and weekly limits, read with Claude Code's sign-in token (off by default)")
     a = ap.parse_args()
     tty = sys.stdout.isatty()
     if a.no_color or not tty and not os.environ.get("FORCE_COLOR"):
@@ -752,7 +933,17 @@ def main():
     root = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
     today = datetime.now().astimezone().date()
 
+    if a.limits:
+        set_config(limits=a.limits == "on")
+        if a.limits == "off":
+            print("ccost: plan limits off")
+            return
+        err = fetch_limits()
+        print(f"ccost: plan limits on{'' if not err else ', but ' + err}")
+        return
+
     if a.sync:
+        update_limits()
         added = sync(root)[2]
         if tty:
             print(f"ccost: {added} new responses recorded in {data_dir() / 'ledger.jsonl'}")
@@ -773,6 +964,7 @@ def main():
             return to_rows(entries.values()), {k: v[1] for k, v in titles.items()}
 
         rows, titles = load()
+        update_limits()
         if tty and not a.static and rows:
             import curses, locale
             locale.setlocale(locale.LC_ALL, "")

@@ -79,6 +79,19 @@ To keep the ledger current without running `ccost` yourself, the installer adds 
 
 `ccost --sync` only reads what was appended since the last run, so it takes a fraction of a second. The ledger holds project paths and session titles; it stays on your machine.
 
+## Plan limits (optional)
+
+```sh
+ccost --limits on
+```
+
+Shows the same limits as `/usage` (the 5-hour session, the weekly limit and any per-model weekly limit, such as Fable's) with how much is used and when each resets. ccost reads them from the endpoint `/usage` uses, with the sign-in token Claude Code stores: `~/.claude/.credentials.json` on Linux, the Keychain on macOS.
+
+- **Off by default**, because it reads that token. `ccost --limits off` turns it off again.
+- **Never refreshes the token**, so it can't interfere with Claude Code's sign-in. While the token is expired, ccost keeps showing the last values with their age; opening Claude Code renews it.
+- **Updated** on every run, on `r`, and by the session-end hook.
+- The endpoint is internal to Claude Code and may change without notice.
+
 ## How it counts
 
 - **Source:** `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`), subagent transcripts included.
